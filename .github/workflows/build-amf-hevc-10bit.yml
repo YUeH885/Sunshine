@@ -1,0 +1,213 @@
+---
+name: Build stable Windows AMF HEVC 10-bit
+permissions: {}
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+env:
+  SUNSHINE_TAG: v2026.929.125923
+  SUNSHINE_COMMIT: f309ef6577c48dd0a0c20883127e66d180248769
+  BUILD_DEPS_TAG: v2026.910.121303
+  MSYS2_PATH_TYPE: inherit
+
+jobs:
+  build-windows-amd64:
+    name: Windows-AMD64
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout stable Sunshine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ env.SUNSHINE_COMMIT }}
+          submodules: recursive
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68  # v6.0.0
+        with:
+          dotnet-version: '10.x'
+
+      - name: Setup MSYS2 UCRT64
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2.33.0
+        with:
+          msystem: UCRT64
+          update: true
+          # Static Qt's system libraries are build dependencies of qt6-static and require explicit installation.
+          install: >-
+            git
+            make
+            pkg-config
+            python
+            wget
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-cppwinrt
+            mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-dbus
+            mingw-w64-ucrt-x86_64-freetype
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-harfbuzz
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-libtiff
+            mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-miniupnpc
+            mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-onevpl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-pcre2
+            mingw-w64-ucrt-x86_64-qt6-static
+            mingw-w64-ucrt-x86_64-toolchain
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: lts/*
+
+      - name: Node.js Path
+        shell: pwsh
+        run: |
+          $NODEJS_BINARY_PATH = (Get-Command node).Source
+          $NODEJS_PATH = Split-Path -Path "$NODEJS_BINARY_PATH" -Parent
+          "NODEJS_PATH=$NODEJS_PATH" >> $env:GITHUB_ENV
+
+      - name: Download and patch stable FFmpeg
+        run: |
+          set -euo pipefail
+
+          wget -q \
+            "https://github.com/LizardByte/build-deps/releases/download/${BUILD_DEPS_TAG}/Windows-AMD64-ffmpeg.tar.gz" \
+            -O ffmpeg.tar.gz
+          echo "ee79a7a295e8fbd24305a3f4ec94a06f550e0b52f49cb1c4535f649e2dd8b234  ffmpeg.tar.gz" | sha256sum --check
+          mkdir -p ffmpeg-dist
+          tar -xzf ffmpeg.tar.gz -C ffmpeg-dist
+          FFMPEG_DIR="$PWD/ffmpeg-dist/ffmpeg"
+          test -f "$FFMPEG_DIR/lib/libavcodec.a"
+
+          python - <<'PY'
+          from pathlib import Path
+
+          source_path = Path("third-party/build-deps/third-party/FFmpeg/FFmpeg/libavcodec/amfenc.c")
+          source = source_path.read_text()
+          check = (
+              "    if (pix_fmt == AV_PIX_FMT_P010) {\n"
+              "        AMF_RETURN_IF_FALSE(ctx, amf_device_ctx->version >= AMF_MAKE_FULL_VERSION(1, 4, 32, 0), AVERROR_UNKNOWN, \"10-bit encoder is not supported by AMD GPU drivers versions lower than 23.30.\\n\");\n"
+              "    }\n\n"
+          )
+          if source.count(check) != 1:
+              raise SystemExit("Expected exactly one old AMF P010 version check")
+          source_path.write_text(source.replace(check, "", 1))
+          PY
+
+          gcc -c -O3 -DNDEBUG -DHAVE_AV_CONFIG_H -w -std=gnu17 \
+            -Ithird-party/build-deps/third-party/FFmpeg/FFmpeg \
+            -I"$FFMPEG_DIR/include" \
+            -I"$FFMPEG_DIR/include/libavcodec" \
+            -Ithird-party/build-deps/third-party/FFmpeg/AMF/amf/public/include \
+            third-party/build-deps/third-party/FFmpeg/FFmpeg/libavcodec/amfenc.c \
+            -o amfenc.o
+
+          test "$(ar t "$FFMPEG_DIR/lib/libavcodec.a" | awk '$0 == "amfenc.o" { count++ } END { print count + 0 }')" = 1
+          ar rs "$FFMPEG_DIR/lib/libavcodec.a" amfenc.o
+          strings "$FFMPEG_DIR/lib/libavcodec.a" > ffmpeg-strings.txt
+          if grep -Fq "10-bit encoder is not supported by AMD GPU drivers" ffmpeg-strings.txt; then
+            echo "AMF P010 version check is still present in libavcodec.a" >&2
+            exit 1
+          fi
+          echo "FFMPEG_DIR=$(cygpath -m "$FFMPEG_DIR")" >> "$GITHUB_ENV"
+
+      - name: Configure stable Sunshine
+        env:
+          BRANCH: master
+          BUILD_VERSION: ${{ env.SUNSHINE_TAG }}
+          COMMIT: ${{ env.SUNSHINE_COMMIT }}
+        run: |
+          set -euo pipefail
+          NODEJS_PATH=$(cygpath "$NODEJS_PATH")
+          export PATH="$PATH:$NODEJS_PATH"
+          cmake \
+            -B cmake-build-amf-hevc-10bit \
+            -G Ninja \
+            -S . \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_WERROR=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DFFMPEG_PREPARED_BINARIES="$FFMPEG_DIR" \
+            -DSUNSHINE_ASSETS_DIR=assets \
+            -DSUNSHINE_PUBLISHER_NAME="${GITHUB_REPOSITORY_OWNER}" \
+            -DSUNSHINE_PUBLISHER_WEBSITE="https://app.lizardbyte.dev" \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://app.lizardbyte.dev/support"
+
+      - name: Build stable Sunshine
+        run: |
+          set -euo pipefail
+          NODEJS_PATH=$(cygpath "$NODEJS_PATH")
+          export PATH="$PATH:$NODEJS_PATH"
+          cmake --build cmake-build-amf-hevc-10bit --parallel
+
+      - name: Check Windows binaries
+        run: |
+          set -euo pipefail
+          binaries=(
+            cmake-build-amf-hevc-10bit/sunshine.exe
+            cmake-build-amf-hevc-10bit/tools/audio-info.exe
+            cmake-build-amf-hevc-10bit/tools/dxgi-info.exe
+            cmake-build-amf-hevc-10bit/tools/sunshinesvc.exe
+          )
+
+          for binary in "${binaries[@]}"; do
+            echo "::group::ldd ${binary}"
+            linkage="$(ldd "$binary")"
+            echo "$linkage"
+            echo "::endgroup::"
+            unexpected_deps="$(awk '
+              BEGIN { IGNORECASE = 1 }
+              $0 ~ /=>[[:space:]]+not found/ { print; next }
+              $1 == "zlib1.dll" { next }
+              $1 ~ /^api-ms-win-/ { next }
+              $1 ~ /^ext-ms-win-/ { next }
+              $0 ~ /=>[[:space:]]+\/(clangarm64|clang64|mingw32|mingw64|ucrt64)\/bin\// { print }
+            ' <<< "$linkage")"
+            if [[ -n "$unexpected_deps" ]]; then
+              echo "Unexpected non-packaged runtime dependencies in ${binary}:" >&2
+              echo "$unexpected_deps" >&2
+              exit 1
+            fi
+          done
+
+          strings cmake-build-amf-hevc-10bit/sunshine.exe > sunshine-strings.txt
+          if grep -Fq "10-bit encoder is not supported by AMD GPU drivers" sunshine-strings.txt; then
+            echo "AMF P010 version check is still present in sunshine.exe" >&2
+            exit 1
+          fi
+
+      - name: Package Windows builds
+        working-directory: cmake-build-amf-hevc-10bit
+        run: |
+          set -euo pipefail
+          ./sunshine.exe --version | tee sunshine-version.txt
+          grep -Fq "Sunshine version: ${SUNSHINE_TAG#v}" sunshine-version.txt
+          cpack -G WIX --config ./CPackConfig.cmake
+          cpack -G ZIP --config ./CPackConfig.cmake
+          mkdir -p ../artifacts
+          mv ./cpack_artifacts/Sunshine.msi ../artifacts/Sunshine-Windows-AMD64-AMF-HEVC-10bit.msi
+          mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-AMF-HEVC-10bit.zip
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: Sunshine-Windows-AMD64-AMF-HEVC-10bit
+          path: |
+            artifacts/Sunshine-Windows-AMD64-AMF-HEVC-10bit.msi
+            artifacts/Sunshine-Windows-AMD64-AMF-HEVC-10bit.zip
+          if-no-files-found: error
