@@ -98,6 +98,10 @@ namespace video {
     av_buffer_unref(&ref);
   }
 
+  bool should_flush_avcodec_encode_session(int frame_num, bool encode_failed) {
+    return frame_num > 0 && !encode_failed;
+  }
+
   namespace nv {
 
     /**
@@ -453,7 +457,8 @@ namespace video {
 
     ~avcodec_encode_session_t() {
       // Flush any remaining frames in the encoder if the encoder started up (frame num > 0)
-      if (avcodec_ctx->frame_num > 0 && avcodec_send_frame(avcodec_ctx.get(), nullptr) == 0) {
+      // A failed hardware encode may leave a partially registered frame that cannot be retried safely.
+      if (should_flush_avcodec_encode_session(avcodec_ctx->frame_num, encode_failed) && avcodec_send_frame(avcodec_ctx.get(), nullptr) == 0) {
         packet_raw_avcodec pkt;
         while (avcodec_receive_packet(avcodec_ctx.get(), pkt.av_packet) == 0);
       }
@@ -478,6 +483,7 @@ namespace video {
       vps = std::move(other.vps);
 
       inject = other.inject;
+      encode_failed = other.encode_failed;
 
       return *this;
     }
@@ -538,6 +544,7 @@ namespace video {
 
     // inject sps/vps data into idr pictures
     int inject;  ///< Number of upcoming IDR frames that should receive rewritten parameter sets.
+    bool encode_failed = false;  ///< Whether FFmpeg reported an encode submission or packet receive error.
   };
 
   /**
@@ -1835,6 +1842,7 @@ namespace video {
     // send the frame to the encoder
     auto ret = avcodec_send_frame(ctx.get(), frame);
     if (ret < 0) {
+      session.encode_failed = true;
       char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
       BOOST_LOG(error) << "Could not send a frame for encoding: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
 
@@ -1849,6 +1857,7 @@ namespace video {
       if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
         return 0;
       } else if (ret < 0) {
+        session.encode_failed = true;
         return ret;
       }
 
@@ -2408,8 +2417,10 @@ namespace video {
     const encoder_t &encoder,
     void *channel_data
   ) {
+    auto shutdown_event = mail->event<bool>(mail::shutdown);
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
+      shutdown_event->raise(true);
       return;
     }
 
@@ -2435,7 +2446,6 @@ namespace video {
     std::chrono::duration<double, std::milli> max_frametime {1000.0 / minimum_fps_target};
     BOOST_LOG(info) << "Minimum FPS target set to ~"sv << minimum_fps_target << "fps ("sv << max_frametime.count() << "ms)"sv;
 
-    auto shutdown_event = mail->event<bool>(mail::shutdown);
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
@@ -2447,6 +2457,7 @@ namespace video {
       // in a separate scope.
       auto dummy_img = disp->alloc_img();
       if (!dummy_img || disp->dummy_img(dummy_img.get()) || session->convert(*dummy_img)) {
+        shutdown_event->raise(true);
         return;
       }
     }
@@ -2477,6 +2488,7 @@ namespace video {
           frame_timestamp = img->frame_timestamp;
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
+            shutdown_event->raise(true);
             return;
           }
         } else if (!images->running()) {
@@ -2500,6 +2512,7 @@ namespace video {
 
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
+        shutdown_event->raise(true);
         return;
       }
 

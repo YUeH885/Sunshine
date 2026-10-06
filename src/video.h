@@ -99,6 +99,15 @@ namespace video {
   void free_buffer(AVBufferRef *ref);
 
   /**
+   * @brief Determine whether an FFmpeg encode session can be safely flushed during teardown.
+   *
+   * @param frame_num Number of frames submitted to the encoder.
+   * @param encode_failed Whether a frame submission or packet receive operation failed.
+   * @return `true` when the session has encoded frames and has not reported an error.
+   */
+  bool should_flush_avcodec_encode_session(int frame_num, bool encode_failed);
+
+  /**
    * @brief Owning pointer for an FFmpeg codec context.
    */
   using avcodec_ctx_t = util::safe_ptr<AVCodecContext, free_ctx>;

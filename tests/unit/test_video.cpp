@@ -23,6 +23,9 @@ extern "C" {
 // local includes
 #include <src/config.h>
 #include <src/video.h>
+#if defined(__linux__) || defined(__FreeBSD__)
+  #include <src/platform/linux/vaapi.h>
+#endif
 
 using namespace std::literals;
 
@@ -121,6 +124,29 @@ INSTANTIATE_TEST_SUITE_P(
     std::make_tuple("h264_nvenc"sv, video::amf::coder_e::cavlc, 0, AV_PROFILE_H264_HIGH)
   )
 );
+
+/**
+ * @brief Skip teardown flush after an encode failure or when no frame was submitted.
+ */
+TEST(AvcodecEncodeSessionFlush, OnlyFlushesHealthySessionsWithSubmittedFrames) {
+  EXPECT_FALSE(video::should_flush_avcodec_encode_session(0, false));
+  EXPECT_FALSE(video::should_flush_avcodec_encode_session(1, true));
+  EXPECT_TRUE(video::should_flush_avcodec_encode_session(1, false));
+}
+
+#if defined(__linux__) || defined(__FreeBSD__)
+/**
+ * @brief Map VA-API quality presets to the driver's advertised range.
+ */
+TEST(VaapiQualityLevel, MapsPresetsAndPreservesAutomaticMode) {
+  EXPECT_EQ(0, va::resolve_quality_level(0, 7));
+  EXPECT_EQ(7, va::resolve_quality_level(1, 7));
+  EXPECT_EQ(4, va::resolve_quality_level(2, 7));
+  EXPECT_EQ(3, va::resolve_quality_level(2, 6));
+  EXPECT_EQ(1, va::resolve_quality_level(3, 7));
+  EXPECT_EQ(0, va::resolve_quality_level(2, 0));
+}
+#endif
 
 /**
  * @brief Parameterized coverage for resolving requested dynamic range against encoder capabilities.

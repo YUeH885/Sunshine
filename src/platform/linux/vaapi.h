@@ -14,6 +14,15 @@ namespace egl {
 
 namespace va {
   /**
+   * @brief Map a VA-API quality preset to the driver's quality range.
+   *
+   * @param quality_preset Quality preset: 0 = automatic, 1 = speed, 2 = balanced, 3 = quality.
+   * @param max_quality Highest quality value advertised by the driver.
+   * @return Quality value to pass to FFmpeg, or 0 when the driver default should be used.
+   */
+  int resolve_quality_level(int quality_preset, int max_quality);
+
+  /**
    * Width --> Width of the image
    * Height --> Height of the image
    * offset_x --> Horizontal offset of the image in the texture

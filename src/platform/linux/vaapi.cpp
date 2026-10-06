@@ -67,6 +67,23 @@ using namespace std::literals;
 extern "C" struct AVBufferRef;
 
 namespace va {
+  int resolve_quality_level(int quality_preset, int max_quality) {
+    if (max_quality <= 0) {
+      return 0;
+    }
+
+    switch (quality_preset) {
+      case 1:  // speed
+        return max_quality;
+      case 2:  // balanced
+        return (1 + max_quality) / 2;
+      case 3:  // quality
+        return 1;
+      default:  // auto or unset
+        return 0;
+    }
+  }
+
   constexpr auto SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 = 0x40000000;  ///< Protocol or platform constant for surface attrib mem type drm prime 2.
   constexpr auto EXPORT_SURFACE_WRITE_ONLY = 0x0002;  ///< GameStream port offset for export surface write only.
   constexpr auto EXPORT_SURFACE_SEPARATE_LAYERS = 0x0004;  ///< GameStream port offset for export surface separate layers.
@@ -315,20 +332,8 @@ namespace va {
         quality_attr.value = 0;
       }
       auto vaapi_quality = config::video.vaapi.vaapi_quality.value_or(0);
-      auto target_quality = 0;
-      switch (vaapi_quality) {
-        default:
-        case 0:  // auto or unset
-          break;
-        case 1:  // low quality (highest value in range)
-        case 2:  // med quality (middle value in range)
-          target_quality = quality_attr.value / vaapi_quality;
-          break;
-        case 3:  // high quality (1)
-          target_quality = 1;
-          break;
-      }
-      if (quality_attr.value > 0) {
+      auto target_quality = resolve_quality_level(vaapi_quality, quality_attr.value);
+      if (target_quality > 0) {
         ctx->compression_level = target_quality;
         BOOST_LOG(info) << "[VAAPI] Quality level set to "sv << ctx->compression_level << " (fastest level: "sv << quality_attr.value << ")"sv;
       }
